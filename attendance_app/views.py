@@ -1,6 +1,7 @@
 import json
 import logging
 import uuid as uuid_lib
+from pathlib import Path
 from datetime import datetime
 from django.utils import timezone
 from django.http import HttpResponse
@@ -8,7 +9,12 @@ from rest_framework import status, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.drawing.image import Image as OpenPyXLImage
+
+from django.contrib.auth import authenticate
+from rest_framework.authtoken.models import Token
+from rest_framework.permissions import AllowAny
 
 from .models import Device, Employee, AttendanceLog
 from .serializers import DeviceSerializer, EmployeeSerializer, AttendanceLogSerializer
@@ -16,16 +22,40 @@ from .serializers import DeviceSerializer, EmployeeSerializer, AttendanceLogSeri
 logger = logging.getLogger('api')
 
 
+def is_authenticated_request(request):
+    """
+    Validates if request is authorized via DRF Token/Session (web dashboard)
+    or via valid X-Device-Id / X-Api-Key headers (kiosk terminal).
+    """
+    if request.user and request.user.is_authenticated:
+        return True
+
+    device_id = request.headers.get('X-Device-Id')
+    api_key = request.headers.get('X-Api-Key')
+    if device_id and api_key:
+        try:
+            device = Device.objects.get(device_id=device_id, is_active=True)
+            if device.api_key == api_key:
+                Device.objects.filter(id=device.id).update(last_seen=timezone.now())
+                return True
+        except Device.DoesNotExist:
+            pass
+    return False
+
+
 class ApiRootView(APIView):
     """
     Root API Endpoint returning online status and service details.
     """
+    permission_classes = [AllowAny]
+
     def get(self, request):
         return Response({
             "status": "online",
             "service": "VKT Biometric Attendance API",
             "version": "1.0.0",
             "endpoints": {
+                "admin_login": "/api/auth/login/",
                 "register_device": "/api/register-device/",
                 "employees": "/api/employees/",
                 "sync_attendance": "/api/sync-attendance/",
@@ -36,7 +66,36 @@ class ApiRootView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+class AdminLoginView(APIView):
+    """
+    DRF Token Login endpoint for Dashboard Administrators.
+    Validates username and password against Django auth_user database.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        username = request.data.get('username')
+        password = request.data.get('password')
+        if not username or not password:
+            return Response({'error': 'Username and password are required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = authenticate(request, username=username, password=password)
+        if user is not None:
+            if not user.is_active:
+                return Response({'error': 'User account is disabled'}, status=status.HTTP_403_FORBIDDEN)
+            token, _ = Token.objects.get_or_create(user=user)
+            return Response({
+                'token': token.key,
+                'username': user.username,
+                'is_staff': user.is_staff
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({'error': 'Invalid username or password'}, status=status.HTTP_401_UNAUTHORIZED)
+
+
 class RegisterDeviceView(APIView):
+    permission_classes = [AllowAny]
+
     def post(self, request):
         device_id = request.data.get('device_id')
         name = request.data.get('device_name', request.data.get('name', 'Industrial Kiosk'))
@@ -62,6 +121,8 @@ class DeviceListView(generics.ListAPIView):
     serializer_class = DeviceSerializer
 
     def list(self, request, *args, **kwargs):
+        if not is_authenticated_request(request):
+            return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -72,9 +133,12 @@ class EmployeeListCreateView(generics.ListCreateAPIView):
     serializer_class = EmployeeSerializer
 
     def list(self, request, *args, **kwargs):
+        if not is_authenticated_request(request):
+            return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 
 class SyncAttendanceView(APIView):
@@ -180,6 +244,8 @@ class AttendanceLogListView(generics.ListAPIView):
         return queryset
 
     def list(self, request, *args, **kwargs):
+        if not is_authenticated_request(request):
+            return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
         queryset = self.filter_queryset(self.get_queryset())
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -188,48 +254,136 @@ AttendanceListView = AttendanceLogListView
 
 
 class ExportExcelReportView(APIView):
+    """
+    Generates detailed Excel report with embedded corporate logo graphics,
+    corporate header hierarchy, alternating row shading, and individual event rows.
+    """
     def get(self, request):
+        if not is_authenticated_request(request):
+            return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
+
         target_date_str = request.query_params.get('date', datetime.now().strftime('%Y-%m-%d'))
+
         
         all_employees = Employee.objects.all().order_by('name')
         day_logs = AttendanceLog.objects.filter(date=target_date_str).order_by('timestamp')
-
-        logs_by_emp = {}
-        for log in day_logs:
-            logs_by_emp.setdefault(log.emp_id, []).append(log)
 
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = f"Report {target_date_str}"
 
-        headers = ['Employee ID', 'Employee Name', 'Department', 'Date', 'First IN Time', 'Last OUT Time', 'Total Punch Count', 'Status']
-        ws.append(headers)
+        # ── Embed Corporate Logo Graphics ─────────────────────────────────────
+        base_dir = Path(__file__).resolve().parent.parent.parent
+        sp_logo_path = base_dir / 'assets' / 'images' / 'logo_spinfotech.jpeg'
+        vkt_logo_path = base_dir / 'assets' / 'images' / 'logo_vkt.jpg'
+
+        if sp_logo_path.exists():
+            try:
+                img_sp = OpenPyXLImage(str(sp_logo_path))
+                img_sp.width = 135
+                img_sp.height = 48
+                ws.add_image(img_sp, 'A1')
+            except Exception as e:
+                logger.warning(f"Could not embed S.P.Infotech logo: {e}")
+
+        if vkt_logo_path.exists():
+            try:
+                img_vkt = OpenPyXLImage(str(vkt_logo_path))
+                img_vkt.width = 115
+                img_vkt.height = 42
+                ws.add_image(img_vkt, 'G1')
+            except Exception as e:
+                logger.warning(f"Could not embed VKT logo: {e}")
+
+        # Row Heights & Spacing
+        ws.row_dimensions[1].height = 24
+        ws.row_dimensions[2].height = 20
+        ws.row_dimensions[3].height = 20
+        ws.row_dimensions[4].height = 12
+        ws.row_dimensions[5].height = 26
+
+        # Corporate Header Text Hierarchy
+        c1 = ws.cell(row=1, column=3, value="PRIMARY SOFTWARE PROVIDER: S.P. INFOTECH")
+        c1.font = Font(size=11, bold=True, color="1E293B")
+        c2 = ws.cell(row=2, column=3, value="CLIENT ENTERPRISE: V.K. TOURS & TRAVELS")
+        c2.font = Font(size=10, bold=False, color="475569")
+        c3 = ws.cell(row=3, column=3, value=f"DAILY DETAILED ATTENDANCE REPORT — DATE: {target_date_str}")
+        c3.font = Font(size=10, bold=True, color="1D4ED8")
+
+        headers = ['Employee ID', 'Employee Name', 'Department', 'Date', 'Time', 'Punch Type', 'Confidence Score', 'Timestamp', 'Record UUID']
+        ws.append([]) # row 4 blank
 
         header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
+        header_font = Font(color="FFFFFF", bold=True, size=10)
+        thin_border = Border(
+            left=Side(style='thin', color='E2E8F0'),
+            right=Side(style='thin', color='E2E8F0'),
+            top=Side(style='thin', color='E2E8F0'),
+            bottom=Side(style='thin', color='E2E8F0')
+        )
+
+        header_row_idx = 5
         for col_num, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_num)
+            cell = ws.cell(row=header_row_idx, column=col_num, value=header)
             cell.fill = header_fill
             cell.font = header_font
-            cell.alignment = Alignment(horizontal="center")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        for emp in all_employees:
-            emp_logs = logs_by_emp.get(emp.emp_id, [])
-            if emp_logs:
-                first_in_log = next((l for l in emp_logs if l.type == 'IN'), emp_logs[0])
-                last_out_log = next((l for l in reversed(emp_logs) if l.type == 'OUT'), emp_logs[-1])
-                
-                first_in = str(first_in_log.time)
-                last_out = str(last_out_log.time)
-                punch_count = len(emp_logs)
-                status_str = 'PRESENT'
+        logs_by_emp = {}
+        for log in day_logs:
+            logs_by_emp.setdefault(log.emp_id, []).append(log)
+
+        all_emp_ids = list(dict.fromkeys([e.emp_id for e in all_employees] + list(logs_by_emp.keys())))
+
+        even_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        odd_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+
+        current_row_idx = 6
+        for emp_id in all_emp_ids:
+            emp = next((e for e in all_employees if e.emp_id == emp_id), None)
+            emp_name = emp.name if emp else (logs_by_emp[emp_id][0].emp_name if logs_by_emp.get(emp_id) else emp_id)
+            department = emp.department if emp else 'Unregistered'
+            emp_logs = logs_by_emp.get(emp_id, [])
+
+            rows_to_add = []
+            if not emp_logs:
+                rows_to_add.append([emp_id, emp_name, department, target_date_str, '-', 'ABSENT', '-', '-', '-'])
             else:
-                first_in = '-'
-                last_out = '-'
-                punch_count = 0
-                status_str = 'ABSENT'
+                for log in emp_logs:
+                    rows_to_add.append([
+                        log.emp_id,
+                        log.emp_name,
+                        department,
+                        log.date,
+                        log.time.strftime('%H:%M:%S') if hasattr(log.time, 'strftime') else str(log.time),
+                        log.type,
+                        f"{log.confidence:.3f}",
+                        log.timestamp.isoformat() if hasattr(log.timestamp, 'isoformat') else str(log.timestamp),
+                        log.uuid
+                    ])
 
-            ws.append([emp.emp_id, emp.name, emp.department, target_date_str, first_in, last_out, punch_count, status_str])
+            for row_values in rows_to_add:
+                row_fill = even_fill if current_row_idx % 2 == 0 else odd_fill
+                for col_idx, val in enumerate(row_values, 1):
+                    c = ws.cell(row=current_row_idx, column=col_idx, value=val)
+                    c.fill = row_fill
+                    c.border = thin_border
+                    c.font = Font(size=9, color="0F172A")
+                    if col_idx in (1, 4, 5, 6, 7):
+                        c.alignment = Alignment(horizontal="center", vertical="center")
+                    else:
+                        c.alignment = Alignment(horizontal="left", vertical="center")
+                ws.row_dimensions[current_row_idx].height = 20
+                current_row_idx += 1
+
+        # Auto-fit column widths
+        for col in ws.columns:
+            max_len = 0
+            col_letter = openpyxl.utils.get_column_letter(col[0].column)
+            for cell in col:
+                if cell.row >= 5 and cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
 
         response = HttpResponse(
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -237,3 +391,4 @@ class ExportExcelReportView(APIView):
         response['Content-Disposition'] = f'attachment; filename="Attendance_Report_{target_date_str}.xlsx"'
         wb.save(response)
         return response
+

@@ -1,0 +1,37 @@
+# Python compiled files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# SQLite database (local dev only — production uses PostgreSQL)
+*.sqlite3
+db.sqlite3
+
+# Environment / secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Django collected static files
+staticfiles/
+
+# Logs
+*.log
+
+# Django media uploads (if any)
+media/
+
+# Local virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
