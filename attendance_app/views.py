@@ -95,32 +95,6 @@ class AdminLoginView(APIView):
             return Response({'error': 'Invalid username or password'}, status=status.HTTP_401_UNAUTHORIZED)
 
 
-class AdminPasswordResetView(APIView):
-    permission_classes = [AllowAny]
-
-    def post(self, request):
-        try:
-            secret = request.data.get('secret')
-            new_password = request.data.get('new_password')
-            expected_secret = getattr(settings, 'SECRET_KEY', None)
-            fallback_secret = 'django-insecure-vkt-biometric-attendance-key-production-ready'
-            master_token = 'vkt_reset_token_2026_secure'
-            
-            if secret in (expected_secret, fallback_secret, master_token) and new_password:
-                from django.contrib.auth.models import User
-                user = User.objects.filter(username='admin').first()
-                if not user:
-                    user = User.objects.create_superuser('admin', 'admin@example.com', new_password)
-                else:
-                    user.set_password(new_password)
-                    user.save()
-                return Response({'status': 'success', 'message': 'Admin password updated successfully'}, status=status.HTTP_200_OK)
-            return Response({'error': 'Invalid secret key or password missing'}, status=status.HTTP_403_FORBIDDEN)
-        except Exception as e:
-            logger.error(f"Password reset error: {e}")
-            return Response({'error': f"Exception: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-
-
 class RegisterDeviceView(APIView):
     permission_classes = [AllowAny]
 

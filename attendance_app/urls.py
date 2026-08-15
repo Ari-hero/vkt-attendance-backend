@@ -2,7 +2,6 @@ from django.urls import path
 from .views import (
     ApiRootView,
     AdminLoginView,
-    AdminPasswordResetView,
     RegisterDeviceView,
     EmployeeListCreateView,
     SyncAttendanceView,
@@ -14,7 +13,6 @@ from .views import (
 urlpatterns = [
     path('', ApiRootView.as_view(), name='api-root'),
     path('auth/login/', AdminLoginView.as_view(), name='admin-login'),
-    path('auth/reset-admin-password/', AdminPasswordResetView.as_view(), name='reset-admin-password'),
     path('register-device/', RegisterDeviceView.as_view(), name='register-device'),
     path('employees/', EmployeeListCreateView.as_view(), name='employees'),
     path('sync-attendance/', SyncAttendanceView.as_view(), name='sync-attendance'),
