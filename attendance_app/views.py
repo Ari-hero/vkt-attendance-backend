@@ -1,3 +1,4 @@
+import os
 import json
 import logging
 import uuid as uuid_lib
@@ -5,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from django.utils import timezone
 from django.http import HttpResponse
+from django.conf import settings
 from rest_framework import status, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -97,20 +99,24 @@ class AdminPasswordResetView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        secret = request.data.get('secret')
-        new_password = request.data.get('new_password')
-        expected_secret = os.environ.get('SECRET_KEY', 'django-insecure-vkt-biometric-attendance-key-production-ready')
-        
-        if secret and secret == expected_secret and new_password:
-            from django.contrib.auth.models import User
-            user = User.objects.filter(username='admin').first()
-            if not user:
-                user = User.objects.create_superuser('admin', 'admin@example.com', new_password)
-            else:
-                user.set_password(new_password)
-                user.save()
-            return Response({'status': 'success', 'message': 'Admin password updated successfully'}, status=status.HTTP_200_OK)
-        return Response({'error': 'Invalid secret key or password missing'}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            secret = request.data.get('secret')
+            new_password = request.data.get('new_password')
+            expected_secret = getattr(settings, 'SECRET_KEY', os.environ.get('SECRET_KEY', 'django-insecure-vkt-biometric-attendance-key-production-ready'))
+            
+            if secret and secret == expected_secret and new_password:
+                from django.contrib.auth.models import User
+                user = User.objects.filter(username='admin').first()
+                if not user:
+                    user = User.objects.create_superuser('admin', 'admin@example.com', new_password)
+                else:
+                    user.set_password(new_password)
+                    user.save()
+                return Response({'status': 'success', 'message': 'Admin password updated successfully'}, status=status.HTTP_200_OK)
+            return Response({'error': 'Invalid secret key or password missing'}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            logger.error(f"Password reset error: {e}")
+            return Response({'error': f"Exception: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class RegisterDeviceView(APIView):
