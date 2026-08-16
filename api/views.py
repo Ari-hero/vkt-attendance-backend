@@ -238,14 +238,14 @@ class AttendanceLogListView(generics.ListAPIView):
 class ExportExcelReportView(APIView):
     """
     Generates detailed Excel report with embedded corporate logo graphics,
-    corporate header hierarchy, alternating row shading, and individual event rows.
+    corporate header hierarchy, alternating row shading, freeze panes, and print setup.
     """
     def get(self, request):
         if not is_authenticated_request(request):
             return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
+
         target_date_str = request.query_params.get('date', datetime.now().strftime('%Y-%m-%d'))
 
-        
         all_employees = Employee.objects.all().order_by('name')
         day_logs = AttendanceLog.objects.filter(date=target_date_str).order_by('timestamp')
 
@@ -253,46 +253,70 @@ class ExportExcelReportView(APIView):
         ws = wb.active
         ws.title = f"Report {target_date_str}"
 
-        # ── Embed Corporate Logo Graphics ─────────────────────────────────────
+        # ── Page Setup & Print Configurations ─────────────────────────────────
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.print_title_rows = '5:5'
+
+        # ── Freeze Panes (Header row 5 stays visible on scroll) ────────────────
+        ws.freeze_panes = 'A6'
+
+        # ── Logo Embedding & Proportional Scaling ──────────────────────────────
         base_dir = Path(__file__).resolve().parent.parent.parent
         sp_logo_path = base_dir / 'assets' / 'images' / 'logo_spinfotech.jpeg'
         vkt_logo_path = base_dir / 'assets' / 'images' / 'logo_vkt.jpg'
 
+        # S.P. Infotech Logo (894x846, near 1:1 square ratio -> 52x49)
         if sp_logo_path.exists():
             try:
                 img_sp = OpenPyXLImage(str(sp_logo_path))
-                img_sp.width = 135
-                img_sp.height = 48
+                img_sp.width = 52
+                img_sp.height = 49
                 ws.add_image(img_sp, 'A1')
             except Exception as e:
                 logger.warning(f"Could not embed S.P.Infotech logo: {e}")
 
+        # V.K. Tours Logo (902x211, wide 4.27:1 ratio -> 175x41)
         if vkt_logo_path.exists():
             try:
                 img_vkt = OpenPyXLImage(str(vkt_logo_path))
-                img_vkt.width = 115
-                img_vkt.height = 42
-                ws.add_image(img_vkt, 'G1')
+                img_vkt.width = 175
+                img_vkt.height = 41
+                ws.add_image(img_vkt, 'H1')
             except Exception as e:
                 logger.warning(f"Could not embed VKT logo: {e}")
 
-        # Row Heights & Spacing
+        # Row Heights
         ws.row_dimensions[1].height = 24
         ws.row_dimensions[2].height = 20
-        ws.row_dimensions[3].height = 20
-        ws.row_dimensions[4].height = 12
+        ws.row_dimensions[3].height = 22
+        ws.row_dimensions[4].height = 10
         ws.row_dimensions[5].height = 26
 
-        # Corporate Header Text Hierarchy
-        c1 = ws.cell(row=1, column=3, value="PRIMARY SOFTWARE PROVIDER: S.P. INFOTECH")
-        c1.font = Font(size=11, bold=True, color="1E293B")
-        c2 = ws.cell(row=2, column=3, value="CLIENT ENTERPRISE: V.K. TOURS & TRAVELS")
-        c2.font = Font(size=10, bold=False, color="475569")
-        c3 = ws.cell(row=3, column=3, value=f"DAILY DETAILED ATTENDANCE REPORT — DATE: {target_date_str}")
-        c3.font = Font(size=10, bold=True, color="1D4ED8")
+        # Corporate Header Hierarchy (Centered in main banner columns B to G)
+        c1 = ws.cell(row=1, column=2, value="S.P. INFOTECH")
+        c1.font = Font(size=14, bold=True, color="1E293B")
+        c1.alignment = Alignment(horizontal="left", vertical="center")
+
+        c2 = ws.cell(row=2, column=2, value="V.K. TOURS & TRAVELS — ENTERPRISE ATTENDANCE")
+        c2.font = Font(size=10, bold=True, color="475569")
+        c2.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Convert YYYY-MM-DD to DD-MM-YYYY for display
+        try:
+            display_target_date = datetime.strptime(target_date_str, '%Y-%m-%d').strftime('%d-%m-%Y')
+        except Exception:
+            display_target_date = target_date_str
+
+        c3 = ws.cell(row=3, column=2, value=f"DAILY DETAILED ATTENDANCE REPORT  |  DATE: {display_target_date}")
+        c3.font = Font(size=11, bold=True, color="1D4ED8")
+        c3.alignment = Alignment(horizontal="left", vertical="center")
 
         headers = ['Employee ID', 'Employee Name', 'Department', 'Date', 'Time', 'Punch Type', 'Confidence Score', 'Timestamp', 'Record UUID']
-        ws.append([]) # row 4 blank
+        ws.append([]) # Row 4 space
 
         header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True, size=10)
@@ -318,6 +342,9 @@ class ExportExcelReportView(APIView):
 
         even_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
         odd_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+        in_fill = PatternFill(start_color="F0FDF4", end_color="F0FDF4", fill_type="solid")
+        out_fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
+        absent_fill = PatternFill(start_color="FFFBEB", end_color="FFFBEB", fill_type="solid")
 
         current_row_idx = 6
         for emp_id in all_emp_ids:
@@ -328,14 +355,19 @@ class ExportExcelReportView(APIView):
 
             rows_to_add = []
             if not emp_logs:
-                rows_to_add.append([emp_id, emp_name, department, target_date_str, '-', 'ABSENT', '-', '-', '-'])
+                rows_to_add.append([emp_id, emp_name, department, display_target_date, '-', 'ABSENT', '-', '-', '-'])
             else:
                 for log in emp_logs:
+                    try:
+                        display_log_date = datetime.strptime(log.date, '%Y-%m-%d').strftime('%d-%m-%Y')
+                    except Exception:
+                        display_log_date = log.date
+
                     rows_to_add.append([
                         log.emp_id,
                         log.emp_name,
                         department,
-                        log.date,
+                        display_log_date,
                         log.time.strftime('%H:%M:%S') if hasattr(log.time, 'strftime') else str(log.time),
                         log.type,
                         f"{log.confidence:.3f}",
@@ -345,11 +377,26 @@ class ExportExcelReportView(APIView):
 
             for row_values in rows_to_add:
                 row_fill = even_fill if current_row_idx % 2 == 0 else odd_fill
+                punch_type_val = row_values[5]
+
                 for col_idx, val in enumerate(row_values, 1):
                     c = ws.cell(row=current_row_idx, column=col_idx, value=val)
                     c.fill = row_fill
                     c.border = thin_border
                     c.font = Font(size=9, color="0F172A")
+
+                    # Highlight Punch Type cell specifically
+                    if col_idx == 6:
+                        if punch_type_val == 'IN':
+                            c.fill = in_fill
+                            c.font = Font(size=9, bold=True, color="15803D")
+                        elif punch_type_val == 'OUT':
+                            c.fill = out_fill
+                            c.font = Font(size=9, bold=True, color="B91C1C")
+                        elif punch_type_val == 'ABSENT':
+                            c.fill = absent_fill
+                            c.font = Font(size=9, bold=True, color="B45309")
+
                     if col_idx in (1, 4, 5, 6, 7):
                         c.alignment = Alignment(horizontal="center", vertical="center")
                     else:
@@ -357,14 +404,15 @@ class ExportExcelReportView(APIView):
                 ws.row_dimensions[current_row_idx].height = 20
                 current_row_idx += 1
 
-        # Auto-fit column widths
+        # Auto-fit column widths with upper bounds
         for col in ws.columns:
             max_len = 0
             col_letter = openpyxl.utils.get_column_letter(col[0].column)
             for cell in col:
                 if cell.row >= 5 and cell.value:
                     max_len = max(max_len, len(str(cell.value)))
-            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+            calculated_width = min(max(max_len + 4, 12), 36)
+            ws.column_dimensions[col_letter].width = calculated_width
 
         response = HttpResponse(
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
