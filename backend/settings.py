@@ -25,7 +25,6 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'corsheaders',
     'attendance_app',
-    'api',
 ]
 
 MIDDLEWARE = [
@@ -104,6 +103,11 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ── Device Online Status ──────────────────────────────────────────────────────
+# A kiosk is considered ONLINE when its last authenticated communication
+# occurred within this many minutes. Adjust per deployment environment.
+DEVICE_ONLINE_THRESHOLD_MINUTES = int(os.environ.get('DEVICE_ONLINE_THRESHOLD_MINUTES', '10'))
 
 # CSRF Trusted Origins Configuration
 csrf_origins_env = os.environ.get('CSRF_TRUSTED_ORIGINS')

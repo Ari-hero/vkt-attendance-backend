@@ -21,6 +21,7 @@ staticfiles/
 
 # Django media uploads (if any)
 media/
+*.xlsx
 
 # Local virtual environments
 venv/

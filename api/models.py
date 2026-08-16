@@ -48,3 +48,25 @@ class AttendanceLog(models.Model):
 
     def __str__(self):
         return f"{self.emp_name} ({self.emp_id}) - {self.type} at {self.timestamp}"
+
+
+class DeviceProvisioningOTP(models.Model):
+    """
+    Stores short-lived, single-use, rate-limited OTP hashes for device provisioning.
+    Never stores plaintext OTPs.
+    """
+    otp_hash = models.CharField(max_length=64, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey('auth.User', on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    device_name = models.CharField(max_length=200, default='Industrial Kiosk')
+    is_active = models.BooleanField(default=True, db_index=True)
+    attempt_count = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"OTP for {self.device_name} (Active: {self.is_active})"
+
