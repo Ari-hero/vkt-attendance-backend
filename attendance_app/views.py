@@ -20,6 +20,12 @@ from django.contrib.auth import authenticate
 from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny
 
+from io import BytesIO
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors as rl_colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, KeepTogether
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
 from .models import Device, Employee, AttendanceLog
 from .serializers import DeviceSerializer, EmployeeSerializer, AttendanceLogSerializer
 
@@ -68,6 +74,7 @@ class ApiRootView(APIView):
                 "attendance": "/api/attendance/",
                 "daily_data": "/api/reports/daily-data/",
                 "export_excel": "/api/reports/export-excel/",
+                "export_pdf": "/api/reports/export-pdf/",
             }
         }, status=status.HTTP_200_OK)
 
@@ -396,14 +403,24 @@ class AttendanceLogListView(generics.ListAPIView):
 
     def get_queryset(self):
         queryset = AttendanceLog.objects.all().order_by('-timestamp')
-        date_param = self.request.query_params.get('date')
+        start_date = self.request.query_params.get('start_date') or self.request.query_params.get('date')
+        end_date = self.request.query_params.get('end_date') or self.request.query_params.get('date')
         emp_id = self.request.query_params.get('emp_id')
+        emp_ids = self.request.query_params.get('emp_ids')
         log_type = self.request.query_params.get('type')
 
-        if date_param:
-            queryset = queryset.filter(date=date_param)
-        if emp_id:
+        if start_date:
+            queryset = queryset.filter(date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(date__lte=end_date)
+
+        if emp_ids and emp_ids != 'ALL':
+            id_list = [e.strip() for e in emp_ids.split(',') if e.strip()]
+            if id_list:
+                queryset = queryset.filter(emp_id__in=id_list)
+        elif emp_id and emp_id != 'ALL':
             queryset = queryset.filter(emp_id=emp_id)
+
         if log_type and log_type != 'ALL':
             queryset = queryset.filter(type=log_type)
 
@@ -419,39 +436,122 @@ class AttendanceLogListView(generics.ListAPIView):
 AttendanceListView = AttendanceLogListView
 
 
-def get_canonical_attendance_data(target_date_str):
+def format_human_date(date_str):
+    """Converts 'YYYY-MM-DD' to 'DD Mon YYYY' (e.g. '10 Jun 2026')"""
+    try:
+        dt = datetime.strptime(str(date_str).strip(), '%Y-%m-%d')
+        return dt.strftime('%d %b %Y')
+    except Exception:
+        return str(date_str)
+
+
+def format_dmy_date(date_str):
+    """Converts 'YYYY-MM-DD' to 'DD-MM-YYYY'"""
+    try:
+        dt = datetime.strptime(str(date_str).strip(), '%Y-%m-%d')
+        return dt.strftime('%d-%m-%Y')
+    except Exception:
+        return str(date_str)
+
+
+def get_canonical_attendance_data(start_date_str=None, end_date_str=None, emp_ids=None):
     """
     Single Canonical Backend Attendance Dataset generator.
-    Guarantees identical data structure, ordering, and event counts for PDF and Excel exports.
+    Supports inclusive Date Range (start_date to end_date) and Employee Filtering.
+    Guarantees identical data structure, ordering, and event counts for Web Dashboard, PDF, and Excel exports.
     """
-    try:
-        display_date = datetime.strptime(target_date_str, '%Y-%m-%d').strftime('%d-%m-%Y')
-    except Exception:
-        display_date = target_date_str
+    # 1. Normalize dates
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    if not start_date_str and not end_date_str:
+        start_date_str = today_str
+        end_date_str = today_str
+    elif start_date_str and not end_date_str:
+        end_date_str = start_date_str
+    elif end_date_str and not start_date_str:
+        start_date_str = end_date_str
 
-    all_employees = Employee.objects.all().order_by('name')
-    day_logs = AttendanceLog.objects.filter(date=target_date_str).order_by('timestamp')
+    if start_date_str > end_date_str:
+        start_date_str, end_date_str = end_date_str, start_date_str
 
+    if start_date_str == end_date_str:
+        display_date_range = format_human_date(start_date_str)
+        file_date_suffix = format_dmy_date(start_date_str)
+    else:
+        display_date_range = f"{format_human_date(start_date_str)} – {format_human_date(end_date_str)}"
+        file_date_suffix = f"{format_dmy_date(start_date_str)}_to_{format_dmy_date(end_date_str)}"
+
+    # 2. Parse & normalize employee filter
+    emp_ids_list = None
+    if emp_ids and emp_ids != 'ALL':
+        if isinstance(emp_ids, list):
+            emp_ids_list = [str(e).strip() for e in emp_ids if str(e).strip()]
+        else:
+            emp_ids_list = [e.strip() for e in str(emp_ids).split(',') if e.strip()]
+
+    # 3. Query employees & logs
+    all_employees_qs = Employee.objects.all().order_by('name')
+    if emp_ids_list:
+        all_employees_qs = all_employees_qs.filter(emp_id__in=emp_ids_list)
+    all_employees = list(all_employees_qs)
+
+    logs_qs = AttendanceLog.objects.filter(
+        date__gte=start_date_str,
+        date__lte=end_date_str
+    ).order_by('timestamp')
+
+    if emp_ids_list:
+        logs_qs = logs_qs.filter(emp_id__in=emp_ids_list)
+
+    logs = list(logs_qs)
+
+    # 4. Group logs by employee ID
     logs_by_emp = {}
-    for log in day_logs:
+    for log in logs:
         logs_by_emp.setdefault(log.emp_id, []).append(log)
 
     all_emp_ids = list(dict.fromkeys([e.emp_id for e in all_employees] + list(logs_by_emp.keys())))
 
+    # 5. Formulate Employee Scope label
+    if not emp_ids_list:
+        emp_filter_label = "All Employees"
+    else:
+        names = [e.name for e in all_employees]
+        if names:
+            emp_filter_label = ", ".join(names[:3]) + (f" (+{len(names)-3} more)" if len(names) > 3 else "")
+        else:
+            emp_filter_label = ", ".join(emp_ids_list)
+
+    # 6. Calculate per-employee presence breakdown and detailed records
+    employee_summaries = []
     records = []
+
     for emp_id in all_emp_ids:
         emp = next((e for e in all_employees if e.emp_id == emp_id), None)
         emp_name = emp.name if emp else (logs_by_emp[emp_id][0].emp_name if logs_by_emp.get(emp_id) else emp_id)
         department = emp.department if emp else 'Unregistered'
         emp_logs = logs_by_emp.get(emp_id, [])
 
+        distinct_dates = sorted(list(set(str(l.date) for l in emp_logs)))
+        present_days_count = len(distinct_dates)
+        emp_status = 'PRESENT' if present_days_count > 0 else 'ABSENT'
+
+        employee_summaries.append({
+            'emp_id': emp_id,
+            'emp_name': emp_name,
+            'department': department,
+            'present_days': present_days_count,
+            'total_punches': len(emp_logs),
+            'dates_present': [format_dmy_date(d) for d in distinct_dates],
+            'status': emp_status,
+        })
+
         if not emp_logs:
             records.append({
                 'emp_id': emp_id,
                 'emp_name': emp_name,
                 'department': department,
-                'date': display_date,
-                'raw_date': target_date_str,
+                'date': display_date_range if start_date_str != end_date_str else format_dmy_date(start_date_str),
+                'raw_date': start_date_str,
                 'time': '-',
                 'type': 'ABSENT',
                 'confidence': '-',
@@ -461,13 +561,9 @@ def get_canonical_attendance_data(target_date_str):
             })
         else:
             for log in emp_logs:
-                try:
-                    display_log_date = datetime.strptime(str(log.date), '%Y-%m-%d').strftime('%d-%m-%Y')
-                except Exception:
-                    display_log_date = str(log.date)
-
+                display_log_date = format_dmy_date(log.date)
                 time_str = log.time.strftime('%H:%M:%S') if hasattr(log.time, 'strftime') else str(log.time)
-                ts_str = log.timestamp.isoformat() if hasattr(log.timestamp, 'isoformat') else str(log.timestamp)
+                ts_str = log.timestamp.strftime('%d-%m-%Y %H:%M:%S') if hasattr(log.timestamp, 'strftime') else str(log.timestamp)
 
                 records.append({
                     'emp_id': log.emp_id,
@@ -483,16 +579,28 @@ def get_canonical_attendance_data(target_date_str):
                     'is_present': True,
                 })
 
-    present_ids = set(logs_by_emp.keys())
+    present_emp_count = len([s for s in employee_summaries if s['status'] == 'PRESENT'])
+    absent_emp_count = len([s for s in employee_summaries if s['status'] == 'ABSENT'])
+
     return {
-        'target_date': target_date_str,
-        'display_date': display_date,
+        'start_date': start_date_str,
+        'end_date': end_date_str,
+        'display_date': display_date_range,
+        'display_date_range': display_date_range,
+        'file_date_suffix': file_date_suffix,
+        'employee_filter_label': emp_filter_label,
         'summary': {
+            'start_date': start_date_str,
+            'end_date': end_date_str,
+            'display_date_range': display_date_range,
+            'employee_filter_label': emp_filter_label,
             'total_events': len([r for r in records if r['type'] != 'ABSENT']),
-            'present_count': len(present_ids),
-            'enrolled_count': len(all_employees),
+            'present_count': present_emp_count,
+            'absent_count': absent_emp_count,
+            'enrolled_count': len(all_emp_ids),
             'total_rows': len(records),
         },
+        'employee_summaries': employee_summaries,
         'records': records,
     }
 
@@ -504,42 +612,51 @@ class CanonicalReportDataView(APIView):
     def get(self, request):
         if not is_authenticated_request(request):
             return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
-        target_date_str = request.query_params.get('date', datetime.now().strftime('%Y-%m-%d'))
-        data = get_canonical_attendance_data(target_date_str)
+        start_date = request.query_params.get('start_date') or request.query_params.get('date')
+        end_date = request.query_params.get('end_date') or request.query_params.get('date')
+        emp_ids = request.query_params.get('emp_ids') or request.query_params.get('emp_id')
+
+        data = get_canonical_attendance_data(start_date_str=start_date, end_date_str=end_date, emp_ids=emp_ids)
         return Response(data, status=status.HTTP_200_OK)
 
 
 class ExportExcelReportView(APIView):
     """
     Generates detailed Excel report with embedded corporate logo graphics,
-    corporate header hierarchy, alternating row shading, freeze panes, and print setup.
-    Uses the exact canonical attendance dataset.
+    corporate header hierarchy, date range representation, employee scope, alternating row shading,
+    freeze panes, and print setup.
+    Technical columns (Confidence Score and Record UUID) are excluded from the presentation.
     """
     def get(self, request):
         if not is_authenticated_request(request):
             return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
 
-        target_date_str = request.query_params.get('date', datetime.now().strftime('%Y-%m-%d'))
-        report_data = get_canonical_attendance_data(target_date_str)
-        display_target_date = report_data['display_date']
+        start_date = request.query_params.get('start_date') or request.query_params.get('date')
+        end_date = request.query_params.get('end_date') or request.query_params.get('date')
+        emp_ids = request.query_params.get('emp_ids') or request.query_params.get('emp_id')
+
+        report_data = get_canonical_attendance_data(start_date_str=start_date, end_date_str=end_date, emp_ids=emp_ids)
+        display_date_range = report_data['display_date_range']
+        file_date_suffix = report_data['file_date_suffix']
+        emp_filter_label = report_data['employee_filter_label']
         records = report_data['records']
+        summaries = report_data['employee_summaries']
+        summary_stats = report_data['summary']
 
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = f"Report {display_target_date}"
+        ws.title = "Attendance Report"
 
-        # ── Page Setup & Print Configurations ─────────────────────────────────
+        # Page Setup
         ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
         ws.page_setup.paperSize = ws.PAPERSIZE_A4
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
-        ws.print_title_rows = '5:5'
+        ws.print_title_rows = '6:6'
+        ws.freeze_panes = 'A7'
 
-        # ── Freeze Panes (Header row 5 stays visible on scroll) ────────────────
-        ws.freeze_panes = 'A6'
-
-        # ── Logo Embedding & Proportional Scaling ──────────────────────────────
+        # Logo Embedding
         base_dir = Path(__file__).resolve().parent.parent.parent
         sp_logo_path = base_dir / 'assets' / 'images' / 'logo_spinfotech.jpeg'
         vkt_logo_path = base_dir / 'assets' / 'images' / 'logo_vkt.jpg'
@@ -558,7 +675,7 @@ class ExportExcelReportView(APIView):
                 img_vkt = OpenPyXLImage(str(vkt_logo_path))
                 img_vkt.width = 175
                 img_vkt.height = 41
-                ws.add_image(img_vkt, 'H1')
+                ws.add_image(img_vkt, 'G1')
             except Exception as e:
                 logger.warning(f"Could not embed VKT logo: {e}")
 
@@ -566,10 +683,11 @@ class ExportExcelReportView(APIView):
         ws.row_dimensions[1].height = 24
         ws.row_dimensions[2].height = 20
         ws.row_dimensions[3].height = 22
-        ws.row_dimensions[4].height = 10
-        ws.row_dimensions[5].height = 26
+        ws.row_dimensions[4].height = 18
+        ws.row_dimensions[5].height = 10
+        ws.row_dimensions[6].height = 26
 
-        # Corporate Header Hierarchy
+        # Header Hierarchy
         c1 = ws.cell(row=1, column=2, value="S.P. INFOTECH")
         c1.font = Font(size=14, bold=True, color="1E293B")
         c1.alignment = Alignment(horizontal="left", vertical="center")
@@ -578,12 +696,16 @@ class ExportExcelReportView(APIView):
         c2.font = Font(size=10, bold=True, color="475569")
         c2.alignment = Alignment(horizontal="left", vertical="center")
 
-        c3 = ws.cell(row=3, column=2, value=f"DAILY DETAILED ATTENDANCE REPORT  |  DATE: {display_target_date}")
+        c3 = ws.cell(row=3, column=2, value=f"ATTENDANCE REPORT  |  DATE RANGE: {display_date_range}")
         c3.font = Font(size=11, bold=True, color="1D4ED8")
         c3.alignment = Alignment(horizontal="left", vertical="center")
 
-        headers = ['Employee ID', 'Employee Name', 'Department', 'Date', 'Time', 'Punch Type', 'Confidence Score', 'Timestamp', 'Record UUID']
-        ws.append([]) # Row 4 space
+        c4 = ws.cell(row=4, column=2, value=f"EMPLOYEES: {emp_filter_label}  |  POPULATION: {summary_stats['enrolled_count']}  |  PRESENT: {summary_stats['present_count']}  |  TOTAL EVENTS: {summary_stats['total_events']}")
+        c4.font = Font(size=9, bold=True, color="475569")
+        c4.alignment = Alignment(horizontal="left", vertical="center")
+
+        headers = ['Employee ID', 'Employee Name', 'Department', 'Date', 'Time', 'Punch Type', 'Timestamp']
+        ws.append([]) # Row 5 blank spacing
 
         header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True, size=10)
@@ -594,7 +716,7 @@ class ExportExcelReportView(APIView):
             bottom=Side(style='thin', color='E2E8F0')
         )
 
-        header_row_idx = 5
+        header_row_idx = 6
         for col_num, header in enumerate(headers, 1):
             cell = ws.cell(row=header_row_idx, column=col_num, value=header)
             cell.fill = header_fill
@@ -607,7 +729,7 @@ class ExportExcelReportView(APIView):
         out_fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
         absent_fill = PatternFill(start_color="FFFBEB", end_color="FFFBEB", fill_type="solid")
 
-        current_row_idx = 6
+        current_row_idx = 7
         for r in records:
             row_fill = even_fill if current_row_idx % 2 == 0 else odd_fill
             punch_type_val = r['type']
@@ -619,9 +741,7 @@ class ExportExcelReportView(APIView):
                 r['date'],
                 r['time'],
                 r['type'],
-                r['confidence'],
                 r['timestamp'],
-                r['uuid'],
             ]
 
             for col_idx, val in enumerate(row_values, 1):
@@ -630,7 +750,7 @@ class ExportExcelReportView(APIView):
                 c.border = thin_border
                 c.font = Font(size=9, color="0F172A")
 
-                # Highlight Punch Type cell specifically
+                # Highlight Punch Type cell
                 if col_idx == 6:
                     if punch_type_val == 'IN':
                         c.fill = in_fill
@@ -646,24 +766,219 @@ class ExportExcelReportView(APIView):
                     c.alignment = Alignment(horizontal="center", vertical="center")
                 else:
                     c.alignment = Alignment(horizontal="left", vertical="center")
+
             ws.row_dimensions[current_row_idx].height = 20
             current_row_idx += 1
 
-        # Auto-fit column widths with upper bounds
+        # Auto-fit column widths
         for col in ws.columns:
             max_len = 0
             col_letter = openpyxl.utils.get_column_letter(col[0].column)
             for cell in col:
-                if cell.row >= 5 and cell.value:
+                if cell.row >= 6 and cell.value:
                     max_len = max(max_len, len(str(cell.value)))
-            calculated_width = min(max(max_len + 4, 12), 36)
+            calculated_width = min(max(max_len + 4, 14), 32)
             ws.column_dimensions[col_letter].width = calculated_width
 
         response = HttpResponse(
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
-        response['Content-Disposition'] = f'attachment; filename="Attendance_Report_{display_target_date}.xlsx"'
+        response['Content-Disposition'] = f'attachment; filename="Attendance_Report_{file_date_suffix}.xlsx"'
         wb.save(response)
         return response
+
+
+class ExportPdfReportView(APIView):
+    """
+    Generates structured corporate PDF report using ReportLab.
+    Matches the exact canonical attendance dataset, date range representation, and corporate styling.
+    Technical columns (Confidence Score and Record UUID) are excluded from the presentation.
+    """
+    def get(self, request):
+        if not is_authenticated_request(request):
+            return Response({'error': 'Authentication credentials were not provided or are invalid'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        start_date = request.query_params.get('start_date') or request.query_params.get('date')
+        end_date = request.query_params.get('end_date') or request.query_params.get('date')
+        emp_ids = request.query_params.get('emp_ids') or request.query_params.get('emp_id')
+
+        report_data = get_canonical_attendance_data(start_date_str=start_date, end_date_str=end_date, emp_ids=emp_ids)
+        display_date_range = report_data['display_date_range']
+        file_date_suffix = report_data['file_date_suffix']
+        emp_filter_label = report_data['employee_filter_label']
+        records = report_data['records']
+        summaries = report_data['employee_summaries']
+        summary_stats = report_data['summary']
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(A4),
+            leftMargin=24,
+            rightMargin=24,
+            topMargin=20,
+            bottomMargin=20
+        )
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('RTitle', fontName='Helvetica-Bold', fontSize=14, leading=17, textColor=rl_colors.HexColor('#1E293B'))
+        sub_style = ParagraphStyle('RSub', fontName='Helvetica-Bold', fontSize=9, leading=12, textColor=rl_colors.HexColor('#475569'))
+        meta_style = ParagraphStyle('RMeta', fontName='Helvetica-Bold', fontSize=10, leading=13, textColor=rl_colors.HexColor('#1D4ED8'))
+        filter_style = ParagraphStyle('RFilter', fontName='Helvetica', fontSize=9, leading=12, textColor=rl_colors.HexColor('#64748B'))
+        section_style = ParagraphStyle('RSect', fontName='Helvetica-Bold', fontSize=11, leading=14, textColor=rl_colors.HexColor('#1E293B'), spaceBefore=8, spaceAfter=4)
+        th_style = ParagraphStyle('RTH', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=rl_colors.white, alignment=1)
+        td_style = ParagraphStyle('RTD', fontName='Helvetica', fontSize=8, leading=10, textColor=rl_colors.HexColor('#0F172A'))
+        td_center = ParagraphStyle('RTDC', fontName='Helvetica', fontSize=8, leading=10, textColor=rl_colors.HexColor('#0F172A'), alignment=1)
+        td_in = ParagraphStyle('RTDIN', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=rl_colors.HexColor('#15803D'), alignment=1)
+        td_out = ParagraphStyle('RTDOUT', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=rl_colors.HexColor('#B91C1C'), alignment=1)
+        td_abs = ParagraphStyle('RTDABS', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=rl_colors.HexColor('#B45309'), alignment=1)
+
+        elements = []
+
+        # 1. Header with Logos
+        base_dir = Path(__file__).resolve().parent.parent.parent
+        sp_logo_path = str(base_dir / 'assets' / 'images' / 'logo_spinfotech.jpeg')
+        vkt_logo_path = str(base_dir / 'assets' / 'images' / 'logo_vkt.jpg')
+
+        header_cells = []
+        if os.path.exists(sp_logo_path):
+            img_sp = RLImage(sp_logo_path, width=44, height=40)
+            header_cells.append(img_sp)
+        else:
+            header_cells.append('')
+
+        header_text = [
+            Paragraph("S.P. INFOTECH", title_style),
+            Paragraph("V.K. TOURS & TRAVELS — ENTERPRISE ATTENDANCE", sub_style),
+            Paragraph(f"ATTENDANCE REPORT  |  DATE RANGE: {display_date_range}", meta_style),
+            Paragraph(f"Employees: {emp_filter_label}", filter_style),
+        ]
+        header_cells.append(header_text)
+
+        if os.path.exists(vkt_logo_path):
+            img_vkt = RLImage(vkt_logo_path, width=120, height=28)
+            header_cells.append(img_vkt)
+        else:
+            header_cells.append('')
+
+        header_table = Table([header_cells], colWidths=[50, 600, 130])
+        header_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+            ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(header_table)
+        elements.append(Spacer(1, 8))
+
+        # 2. Executive Summary Metrics Cards
+        summary_data = [
+            [
+                Paragraph("TOTAL POPULATION", ParagraphStyle('S1', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#64748B'), alignment=1)),
+                Paragraph("PRESENT STAFF", ParagraphStyle('S2', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#16A34A'), alignment=1)),
+                Paragraph("ABSENT STAFF", ParagraphStyle('S3', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#DC2626'), alignment=1)),
+                Paragraph("TOTAL PUNCH EVENTS", ParagraphStyle('S4', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#1D4ED8'), alignment=1)),
+            ],
+            [
+                Paragraph(str(summary_stats['enrolled_count']), ParagraphStyle('V1', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#1E293B'), alignment=1)),
+                Paragraph(str(summary_stats['present_count']), ParagraphStyle('V2', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#16A34A'), alignment=1)),
+                Paragraph(str(summary_stats['absent_count']), ParagraphStyle('V3', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#DC2626'), alignment=1)),
+                Paragraph(str(summary_stats['total_events']), ParagraphStyle('V4', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#1D4ED8'), alignment=1)),
+            ]
+        ]
+        sum_table = Table(summary_data, colWidths=[195, 195, 195, 195])
+        sum_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), rl_colors.HexColor('#F8FAFC')),
+            ('BOX', (0, 0), (-1, -1), 1, rl_colors.HexColor('#E2E8F0')),
+            ('INNERGRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#E2E8F0')),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(sum_table)
+        elements.append(Spacer(1, 10))
+
+        # 3. Employee Presence Summary Table
+        elements.append(Paragraph("1. Employee Presence Summary", section_style))
+        emp_sum_headers = [
+            Paragraph("Emp ID", th_style),
+            Paragraph("Employee Name", th_style),
+            Paragraph("Department", th_style),
+            Paragraph("Days Present", th_style),
+            Paragraph("Total Punches", th_style),
+            Paragraph("Status", th_style),
+            Paragraph("Attendance Dates", th_style),
+        ]
+        emp_sum_rows = [emp_sum_headers]
+
+        for s in summaries:
+            dates_str = ", ".join(s['dates_present']) if s['dates_present'] else "-"
+            st_style = td_in if s['status'] == 'PRESENT' else td_abs
+            emp_sum_rows.append([
+                Paragraph(s['emp_id'], td_center),
+                Paragraph(s['emp_name'], td_style),
+                Paragraph(s['department'], td_style),
+                Paragraph(str(s['present_days']), td_center),
+                Paragraph(str(s['total_punches']), td_center),
+                Paragraph(s['status'], st_style),
+                Paragraph(dates_str, td_style),
+            ])
+
+        emp_sum_table = Table(emp_sum_rows, colWidths=[65, 130, 110, 75, 75, 75, 250])
+        emp_sum_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#1E293B')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#E2E8F0')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor('#F8FAFC')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(emp_sum_table)
+        elements.append(Spacer(1, 10))
+
+        # 4. Detailed Attendance Punch Log (Technical columns Confidence Score & UUID excluded)
+        elements.append(Paragraph("2. Detailed Punch Logs", section_style))
+        log_headers = [
+            Paragraph("Emp ID", th_style),
+            Paragraph("Employee Name", th_style),
+            Paragraph("Department", th_style),
+            Paragraph("Date", th_style),
+            Paragraph("Time", th_style),
+            Paragraph("Type", th_style),
+            Paragraph("Timestamp", th_style),
+        ]
+        log_rows = [log_headers]
+
+        for r in records:
+            p_style = td_in if r['type'] == 'IN' else (td_out if r['type'] == 'OUT' else td_abs)
+            log_rows.append([
+                Paragraph(r['emp_id'], td_center),
+                Paragraph(r['emp_name'], td_style),
+                Paragraph(r['department'], td_style),
+                Paragraph(r['date'], td_center),
+                Paragraph(r['time'], td_center),
+                Paragraph(r['type'], p_style),
+                Paragraph(r['timestamp'], td_center),
+            ])
+
+        log_table = Table(log_rows, colWidths=[65, 140, 120, 90, 80, 85, 200])
+        log_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#1E293B')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.HexColor('#E2E8F0')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor('#F8FAFC')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(log_table)
+
+        doc.build(elements)
+        pdf_content = buffer.getvalue()
+        buffer.close()
+
+        response = HttpResponse(content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="Attendance_Report_{file_date_suffix}.pdf"'
+        response.write(pdf_content)
+        return response
+
 
 

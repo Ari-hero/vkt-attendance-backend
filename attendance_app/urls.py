@@ -10,6 +10,7 @@ from .views import (
     AttendanceListView,
     CanonicalReportDataView,
     ExportExcelReportView,
+    ExportPdfReportView,
 )
 
 urlpatterns = [
@@ -23,5 +24,6 @@ urlpatterns = [
     path('attendance/', AttendanceListView.as_view(), name='attendance'),
     path('reports/daily-data/', CanonicalReportDataView.as_view(), name='canonical-report-data'),
     path('reports/export-excel/', ExportExcelReportView.as_view(), name='export-excel'),
+    path('reports/export-pdf/', ExportPdfReportView.as_view(), name='export-pdf'),
 ]
 
