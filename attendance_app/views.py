@@ -358,6 +358,32 @@ class SyncAttendanceView(APIView):
             AttendanceLog.objects.bulk_create(new_logs_to_create, ignore_conflicts=True)
             logger.info(f"Synced {len(new_logs_to_create)} new logs.")
 
+        # Ensure employees enrolled on kiosk are represented in central Employee master
+        incoming_emp_data = {}
+        for item in logs_data:
+            e_id = str(item.get('emp_id', '')).strip()
+            e_name = item.get('emp_name', '')
+            if e_id and e_id not in incoming_emp_data:
+                incoming_emp_data[e_id] = e_name
+
+        if incoming_emp_data:
+            existing_emp_ids = set(
+                Employee.objects.filter(emp_id__in=incoming_emp_data.keys()).values_list('emp_id', flat=True)
+            )
+            new_emps_to_create = [
+                Employee(
+                    emp_id=eid,
+                    name=incoming_emp_data[eid] or f"Emp {eid}",
+                    department="General",
+                    embedding="[]",
+                    photo_url="",
+                )
+                for eid in incoming_emp_data
+                if eid not in existing_emp_ids
+            ]
+            if new_emps_to_create:
+                Employee.objects.bulk_create(new_emps_to_create, ignore_conflicts=True)
+
         return Response({
             'status': 'success',
             'synced_count': len(processed_list),
