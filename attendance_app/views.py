@@ -604,16 +604,35 @@ class CanonicalReportDataView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
 
+def get_logo_path(filename):
+    """
+    Resolves the absolute path to a logo asset across local monorepo, backend repo, and deployment containers.
+    """
+    base_file = Path(__file__).resolve()
+    candidates = [
+        base_file.parent.parent / 'assets' / 'images' / filename,
+        base_file.parent.parent.parent / 'assets' / 'images' / filename,
+        Path(os.getcwd()) / 'assets' / 'images' / filename,
+        Path(os.getcwd()) / 'backend' / 'assets' / 'images' / filename,
+        base_file.parent.parent / 'dashboard' / 'src' / 'assets' / filename,
+        base_file.parent.parent.parent / 'dashboard' / 'src' / 'assets' / filename,
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
 class ExportExcelReportView(APIView):
     """
     Generates detailed Excel report matching the visual layout of the PDF report:
-    - Corporate header hierarchy with embedded logo graphics
+    - Corporate header hierarchy with embedded logo graphics (S.P. Infotech at A1, VKT at G1)
     - Date range representation & Employee scope badge
     - Executive Summary KPI metrics cards (Total Enrolled, Present Staff, Total Punch Events)
     - Section 1: Employee Presence Summary table (Days Present, Total Punches, Actual Attendance Dates)
     - Section 2: Detailed Punch Logs table (Actual IN/OUT punches without Confidence Score and Record UUID)
     - Totals / Summary footer row
-    - Print setup: Landscape A4, fit to page width, freeze panes.
+    - Print setup: Landscape A4, fit to page width, repeating header setup.
     """
     def get(self, request):
         if not is_authenticated_request(request):
@@ -641,6 +660,7 @@ class ExportExcelReportView(APIView):
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
+        ws.print_options.horizontalCentered = True
 
         # Styles definition
         thin_border = Border(
@@ -674,22 +694,21 @@ class ExportExcelReportView(APIView):
         out_fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
 
         # 1. Logo Embedding
-        base_dir = Path(__file__).resolve().parent.parent.parent
-        sp_logo_path = base_dir / 'assets' / 'images' / 'logo_spinfotech.jpeg'
-        vkt_logo_path = base_dir / 'assets' / 'images' / 'logo_vkt.jpg'
+        sp_logo_path = get_logo_path('logo_spinfotech.jpeg')
+        vkt_logo_path = get_logo_path('logo_vkt.jpg')
 
-        if sp_logo_path.exists():
+        if sp_logo_path and os.path.exists(sp_logo_path):
             try:
-                img_sp = OpenPyXLImage(str(sp_logo_path))
+                img_sp = OpenPyXLImage(sp_logo_path)
                 img_sp.width = 48
                 img_sp.height = 45
                 ws.add_image(img_sp, 'A1')
             except Exception as e:
                 logger.warning(f"Could not embed S.P.Infotech logo: {e}")
 
-        if vkt_logo_path.exists():
+        if vkt_logo_path and os.path.exists(vkt_logo_path):
             try:
-                img_vkt = OpenPyXLImage(str(vkt_logo_path))
+                img_vkt = OpenPyXLImage(vkt_logo_path)
                 img_vkt.width = 160
                 img_vkt.height = 38
                 ws.add_image(img_vkt, 'G1')
@@ -703,19 +722,23 @@ class ExportExcelReportView(APIView):
         ws.row_dimensions[4].height = 18
         ws.row_dimensions[5].height = 8
 
-        # Header Hierarchy
+        # Header Hierarchy (Columns B to F merged for optimal presentation)
+        ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=6)
         c1 = ws.cell(row=1, column=2, value="S.P. INFOTECH")
         c1.font = Font(size=13, bold=True, color="1E293B")
         c1.alignment = Alignment(horizontal="left", vertical="center")
 
+        ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
         c2 = ws.cell(row=2, column=2, value="V.K. TOURS & TRAVELS — ENTERPRISE ATTENDANCE")
         c2.font = Font(size=9, bold=True, color="475569")
         c2.alignment = Alignment(horizontal="left", vertical="center")
 
+        ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=6)
         c3 = ws.cell(row=3, column=2, value=f"ATTENDANCE REPORT  |  DATE RANGE: {display_date_range}")
         c3.font = Font(size=10, bold=True, color="1D4ED8")
         c3.alignment = Alignment(horizontal="left", vertical="center")
 
+        ws.merge_cells(start_row=4, start_column=2, end_row=4, end_column=6)
         c4 = ws.cell(row=4, column=2, value=f"Employees: {emp_filter_label}")
         c4.font = Font(size=9, bold=False, color="64748B")
         c4.alignment = Alignment(horizontal="left", vertical="center")
@@ -970,12 +993,11 @@ class ExportPdfReportView(APIView):
         elements = []
 
         # 1. Header with Logos
-        base_dir = Path(__file__).resolve().parent.parent.parent
-        sp_logo_path = str(base_dir / 'assets' / 'images' / 'logo_spinfotech.jpeg')
-        vkt_logo_path = str(base_dir / 'assets' / 'images' / 'logo_vkt.jpg')
+        sp_logo_path = get_logo_path('logo_spinfotech.jpeg')
+        vkt_logo_path = get_logo_path('logo_vkt.jpg')
 
         header_cells = []
-        if os.path.exists(sp_logo_path):
+        if sp_logo_path and os.path.exists(sp_logo_path):
             img_sp = RLImage(sp_logo_path, width=44, height=40)
             header_cells.append(img_sp)
         else:
@@ -989,7 +1011,7 @@ class ExportPdfReportView(APIView):
         ]
         header_cells.append(header_text)
 
-        if os.path.exists(vkt_logo_path):
+        if vkt_logo_path and os.path.exists(vkt_logo_path):
             img_vkt = RLImage(vkt_logo_path, width=120, height=28)
             header_cells.append(img_vkt)
         else:
