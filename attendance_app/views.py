@@ -521,10 +521,8 @@ def get_canonical_attendance_data(start_date_str=None, end_date_str=None, emp_id
         else:
             emp_filter_label = ", ".join(emp_ids_list)
 
-    # 6. Calculate per-employee presence breakdown and detailed records
+    # 6. Calculate per-employee presence breakdown and detailed punch records
     employee_summaries = []
-    records = []
-
     for emp_id in all_emp_ids:
         emp = next((e for e in all_employees if e.emp_id == emp_id), None)
         emp_name = emp.name if emp else (logs_by_emp[emp_id][0].emp_name if logs_by_emp.get(emp_id) else emp_id)
@@ -533,7 +531,6 @@ def get_canonical_attendance_data(start_date_str=None, end_date_str=None, emp_id
 
         distinct_dates = sorted(list(set(str(l.date) for l in emp_logs)))
         present_days_count = len(distinct_dates)
-        emp_status = 'PRESENT' if present_days_count > 0 else 'ABSENT'
 
         employee_summaries.append({
             'emp_id': emp_id,
@@ -542,45 +539,33 @@ def get_canonical_attendance_data(start_date_str=None, end_date_str=None, emp_id
             'present_days': present_days_count,
             'total_punches': len(emp_logs),
             'dates_present': [format_dmy_date(d) for d in distinct_dates],
-            'status': emp_status,
+            'has_attendance': present_days_count > 0,
         })
 
-        if not emp_logs:
-            records.append({
-                'emp_id': emp_id,
-                'emp_name': emp_name,
-                'department': department,
-                'date': display_date_range if start_date_str != end_date_str else format_dmy_date(start_date_str),
-                'raw_date': start_date_str,
-                'time': '-',
-                'type': 'ABSENT',
-                'confidence': '-',
-                'timestamp': '-',
-                'uuid': '-',
-                'is_present': False,
-            })
-        else:
-            for log in emp_logs:
-                display_log_date = format_dmy_date(log.date)
-                time_str = log.time.strftime('%H:%M:%S') if hasattr(log.time, 'strftime') else str(log.time)
-                ts_str = log.timestamp.strftime('%d-%m-%Y %H:%M:%S') if hasattr(log.timestamp, 'strftime') else str(log.timestamp)
+    # Detailed punch logs: contains ONLY actual recorded punch events in the date range
+    records = []
+    for log in logs:
+        emp = next((e for e in all_employees if e.emp_id == log.emp_id), None)
+        department = emp.department if emp else 'Unregistered'
+        display_log_date = format_dmy_date(log.date)
+        time_str = log.time.strftime('%H:%M:%S') if hasattr(log.time, 'strftime') else str(log.time)
+        ts_str = log.timestamp.strftime('%d-%m-%Y %H:%M:%S') if hasattr(log.timestamp, 'strftime') else str(log.timestamp)
 
-                records.append({
-                    'emp_id': log.emp_id,
-                    'emp_name': log.emp_name,
-                    'department': department,
-                    'date': display_log_date,
-                    'raw_date': str(log.date),
-                    'time': time_str,
-                    'type': log.type,
-                    'confidence': f"{log.confidence:.3f}",
-                    'timestamp': ts_str,
-                    'uuid': log.uuid,
-                    'is_present': True,
-                })
+        records.append({
+            'emp_id': log.emp_id,
+            'emp_name': log.emp_name,
+            'department': department,
+            'date': display_log_date,
+            'raw_date': str(log.date),
+            'time': time_str,
+            'type': log.type,
+            'confidence': f"{log.confidence:.3f}",
+            'timestamp': ts_str,
+            'uuid': log.uuid,
+            'is_present': True,
+        })
 
-    present_emp_count = len([s for s in employee_summaries if s['status'] == 'PRESENT'])
-    absent_emp_count = len([s for s in employee_summaries if s['status'] == 'ABSENT'])
+    present_emp_count = len([s for s in employee_summaries if s['has_attendance']])
 
     return {
         'start_date': start_date_str,
@@ -594,9 +579,8 @@ def get_canonical_attendance_data(start_date_str=None, end_date_str=None, emp_id
             'end_date': end_date_str,
             'display_date_range': display_date_range,
             'employee_filter_label': emp_filter_label,
-            'total_events': len([r for r in records if r['type'] != 'ABSENT']),
+            'total_events': len(records),
             'present_count': present_emp_count,
-            'absent_count': absent_emp_count,
             'enrolled_count': len(all_emp_ids),
             'total_rows': len(records),
         },
@@ -622,10 +606,14 @@ class CanonicalReportDataView(APIView):
 
 class ExportExcelReportView(APIView):
     """
-    Generates detailed Excel report with embedded corporate logo graphics,
-    corporate header hierarchy, date range representation, employee scope, alternating row shading,
-    freeze panes, and print setup.
-    Technical columns (Confidence Score and Record UUID) are excluded from the presentation.
+    Generates detailed Excel report matching the visual layout of the PDF report:
+    - Corporate header hierarchy with embedded logo graphics
+    - Date range representation & Employee scope badge
+    - Executive Summary KPI metrics cards (Total Enrolled, Present Staff, Total Punch Events)
+    - Section 1: Employee Presence Summary table (Days Present, Total Punches, Actual Attendance Dates)
+    - Section 2: Detailed Punch Logs table (Actual IN/OUT punches without Confidence Score and Record UUID)
+    - Totals / Summary footer row
+    - Print setup: Landscape A4, fit to page width, freeze panes.
     """
     def get(self, request):
         if not is_authenticated_request(request):
@@ -653,10 +641,39 @@ class ExportExcelReportView(APIView):
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
-        ws.print_title_rows = '6:6'
-        ws.freeze_panes = 'A7'
 
-        # Logo Embedding
+        # Styles definition
+        thin_border = Border(
+            left=Side(style='thin', color='E2E8F0'),
+            right=Side(style='thin', color='E2E8F0'),
+            top=Side(style='thin', color='E2E8F0'),
+            bottom=Side(style='thin', color='E2E8F0')
+        )
+        card_top_border = Border(
+            left=Side(style='thin', color='E2E8F0'),
+            right=Side(style='thin', color='E2E8F0'),
+            top=Side(style='thin', color='CBD5E1'),
+            bottom=Side(style='none')
+        )
+        card_bot_border = Border(
+            left=Side(style='thin', color='E2E8F0'),
+            right=Side(style='thin', color='E2E8F0'),
+            top=Side(style='none'),
+            bottom=Side(style='thin', color='CBD5E1')
+        )
+
+        header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True, size=9)
+        section_font = Font(color="1E293B", bold=True, size=11)
+        even_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        odd_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+        kpi_bg_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        summary_footer_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+
+        in_fill = PatternFill(start_color="F0FDF4", end_color="F0FDF4", fill_type="solid")
+        out_fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
+
+        # 1. Logo Embedding
         base_dir = Path(__file__).resolve().parent.parent.parent
         sp_logo_path = base_dir / 'assets' / 'images' / 'logo_spinfotech.jpeg'
         vkt_logo_path = base_dir / 'assets' / 'images' / 'logo_vkt.jpg'
@@ -664,8 +681,8 @@ class ExportExcelReportView(APIView):
         if sp_logo_path.exists():
             try:
                 img_sp = OpenPyXLImage(str(sp_logo_path))
-                img_sp.width = 52
-                img_sp.height = 49
+                img_sp.width = 48
+                img_sp.height = 45
                 ws.add_image(img_sp, 'A1')
             except Exception as e:
                 logger.warning(f"Could not embed S.P.Infotech logo: {e}")
@@ -673,112 +690,230 @@ class ExportExcelReportView(APIView):
         if vkt_logo_path.exists():
             try:
                 img_vkt = OpenPyXLImage(str(vkt_logo_path))
-                img_vkt.width = 175
-                img_vkt.height = 41
+                img_vkt.width = 160
+                img_vkt.height = 38
                 ws.add_image(img_vkt, 'G1')
             except Exception as e:
                 logger.warning(f"Could not embed VKT logo: {e}")
 
-        # Row Heights
-        ws.row_dimensions[1].height = 24
-        ws.row_dimensions[2].height = 20
-        ws.row_dimensions[3].height = 22
+        # Row Heights for Header
+        ws.row_dimensions[1].height = 22
+        ws.row_dimensions[2].height = 18
+        ws.row_dimensions[3].height = 20
         ws.row_dimensions[4].height = 18
-        ws.row_dimensions[5].height = 10
-        ws.row_dimensions[6].height = 26
+        ws.row_dimensions[5].height = 8
 
         # Header Hierarchy
         c1 = ws.cell(row=1, column=2, value="S.P. INFOTECH")
-        c1.font = Font(size=14, bold=True, color="1E293B")
+        c1.font = Font(size=13, bold=True, color="1E293B")
         c1.alignment = Alignment(horizontal="left", vertical="center")
 
         c2 = ws.cell(row=2, column=2, value="V.K. TOURS & TRAVELS — ENTERPRISE ATTENDANCE")
-        c2.font = Font(size=10, bold=True, color="475569")
+        c2.font = Font(size=9, bold=True, color="475569")
         c2.alignment = Alignment(horizontal="left", vertical="center")
 
         c3 = ws.cell(row=3, column=2, value=f"ATTENDANCE REPORT  |  DATE RANGE: {display_date_range}")
-        c3.font = Font(size=11, bold=True, color="1D4ED8")
+        c3.font = Font(size=10, bold=True, color="1D4ED8")
         c3.alignment = Alignment(horizontal="left", vertical="center")
 
-        c4 = ws.cell(row=4, column=2, value=f"EMPLOYEES: {emp_filter_label}  |  POPULATION: {summary_stats['enrolled_count']}  |  PRESENT: {summary_stats['present_count']}  |  TOTAL EVENTS: {summary_stats['total_events']}")
-        c4.font = Font(size=9, bold=True, color="475569")
+        c4 = ws.cell(row=4, column=2, value=f"Employees: {emp_filter_label}")
+        c4.font = Font(size=9, bold=False, color="64748B")
         c4.alignment = Alignment(horizontal="left", vertical="center")
 
-        headers = ['Employee ID', 'Employee Name', 'Department', 'Date', 'Time', 'Punch Type', 'Timestamp']
-        ws.append([]) # Row 5 blank spacing
+        # 2. Executive Summary KPI Cards (Rows 6 and 7) - 3 Cards (No inferred absence)
+        ws.row_dimensions[6].height = 16
+        ws.row_dimensions[7].height = 24
 
-        header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True, size=10)
-        thin_border = Border(
-            left=Side(style='thin', color='E2E8F0'),
-            right=Side(style='thin', color='E2E8F0'),
-            top=Side(style='thin', color='E2E8F0'),
-            bottom=Side(style='thin', color='E2E8F0')
-        )
+        kpis = [
+            ({'start': 1, 'end': 2}, "TOTAL ENROLLED", str(summary_stats['enrolled_count']), "64748B", "1E293B"),
+            ({'start': 3, 'end': 5}, "PRESENT STAFF", str(summary_stats['present_count']), "16A34A", "16A34A"),
+            ({'start': 6, 'end': 7}, "TOTAL PUNCH EVENTS", str(summary_stats['total_events']), "1D4ED8", "1D4ED8"),
+        ]
 
-        header_row_idx = 6
-        for col_num, header in enumerate(headers, 1):
-            cell = ws.cell(row=header_row_idx, column=col_num, value=header)
+        for span, label, val, label_color, val_color in kpis:
+            s_col, e_col = span['start'], span['end']
+            if s_col != e_col:
+                ws.merge_cells(start_row=6, start_column=s_col, end_row=6, end_column=e_col)
+                ws.merge_cells(start_row=7, start_column=s_col, end_row=7, end_column=e_col)
+
+            lbl_cell = ws.cell(row=6, column=s_col, value=label)
+            lbl_cell.font = Font(size=8, bold=True, color=label_color)
+            lbl_cell.alignment = Alignment(horizontal="center", vertical="center")
+            lbl_cell.fill = kpi_bg_fill
+
+            val_cell = ws.cell(row=7, column=s_col, value=val)
+            val_cell.font = Font(size=14, bold=True, color=val_color)
+            val_cell.alignment = Alignment(horizontal="center", vertical="center")
+            val_cell.fill = kpi_bg_fill
+
+            # Apply borders to merged range
+            for col in range(s_col, e_col + 1):
+                c_top = ws.cell(row=6, column=col)
+                c_top.fill = kpi_bg_fill
+                c_top.border = card_top_border
+                c_bot = ws.cell(row=7, column=col)
+                c_bot.fill = kpi_bg_fill
+                c_bot.border = card_bot_border
+
+        ws.row_dimensions[8].height = 10  # Spacer row
+
+        # 3. Section 1: Employee Presence Summary
+        ws.row_dimensions[9].height = 22
+        ws.merge_cells(start_row=9, start_column=1, end_row=9, end_column=7)
+        s1_title = ws.cell(row=9, column=1, value="1. Employee Presence Summary")
+        s1_title.font = section_font
+        s1_title.alignment = Alignment(horizontal="left", vertical="center")
+
+        ws.row_dimensions[10].height = 24
+        # Columns across 7 columns: Emp ID (A), Name (B-C merged), Dept (D), Days Present (E), Punches (F), Dates (G)
+        sum_headers = ['Emp ID', 'Employee Name', 'Department', 'Days Present', 'Total Punches', 'Attendance Dates']
+        # We can use col 1: Emp ID, 2: Name, 3: Dept, 4: Days Present, 5: Total Punches, 6-7: Attendance Dates
+        ws.cell(row=10, column=1, value='Emp ID').alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row=10, column=2, value='Employee Name').alignment = Alignment(horizontal="left", vertical="center")
+        ws.cell(row=10, column=3, value='Department').alignment = Alignment(horizontal="left", vertical="center")
+        ws.cell(row=10, column=4, value='Days Present').alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row=10, column=5, value='Total Punches').alignment = Alignment(horizontal="center", vertical="center")
+        ws.merge_cells(start_row=10, start_column=6, end_row=10, end_column=7)
+        ws.cell(row=10, column=6, value='Attendance Dates').alignment = Alignment(horizontal="left", vertical="center")
+
+        for col_num in range(1, 8):
+            cell = ws.cell(row=10, column=col_num)
             cell.fill = header_fill
             cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
 
-        even_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-        odd_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-        in_fill = PatternFill(start_color="F0FDF4", end_color="F0FDF4", fill_type="solid")
-        out_fill = PatternFill(start_color="FEF2F2", end_color="FEF2F2", fill_type="solid")
-        absent_fill = PatternFill(start_color="FFFBEB", end_color="FFFBEB", fill_type="solid")
+        curr_row = 11
+        for s in summaries:
+            row_fill = even_fill if curr_row % 2 == 0 else odd_fill
+            dates_str = ", ".join(s['dates_present']) if s['dates_present'] else "No punches recorded"
 
-        current_row_idx = 7
-        for r in records:
-            row_fill = even_fill if current_row_idx % 2 == 0 else odd_fill
-            punch_type_val = r['type']
+            ws.cell(row=curr_row, column=1, value=s['emp_id']).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=curr_row, column=2, value=s['emp_name']).alignment = Alignment(horizontal="left", vertical="center")
+            ws.cell(row=curr_row, column=3, value=s['department']).alignment = Alignment(horizontal="left", vertical="center")
+            ws.cell(row=curr_row, column=4, value=s['present_days']).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=curr_row, column=5, value=s['total_punches']).alignment = Alignment(horizontal="center", vertical="center")
+            ws.merge_cells(start_row=curr_row, start_column=6, end_row=curr_row, end_column=7)
+            ws.cell(row=curr_row, column=6, value=dates_str).alignment = Alignment(horizontal="left", vertical="center")
 
-            row_values = [
-                r['emp_id'],
-                r['emp_name'],
-                r['department'],
-                r['date'],
-                r['time'],
-                r['type'],
-                r['timestamp'],
-            ]
-
-            for col_idx, val in enumerate(row_values, 1):
-                c = ws.cell(row=current_row_idx, column=col_idx, value=val)
+            for col_idx in range(1, 8):
+                c = ws.cell(row=curr_row, column=col_idx)
                 c.fill = row_fill
                 c.border = thin_border
-                c.font = Font(size=9, color="0F172A")
+                c.font = Font(size=9, color="0F172A" if s['has_attendance'] else "64748B")
 
-                # Highlight Punch Type cell
-                if col_idx == 6:
-                    if punch_type_val == 'IN':
-                        c.fill = in_fill
-                        c.font = Font(size=9, bold=True, color="15803D")
-                    elif punch_type_val == 'OUT':
-                        c.fill = out_fill
-                        c.font = Font(size=9, bold=True, color="B91C1C")
-                    elif punch_type_val == 'ABSENT':
-                        c.fill = absent_fill
-                        c.font = Font(size=9, bold=True, color="B45309")
+            ws.row_dimensions[curr_row].height = 20
+            curr_row += 1
 
-                if col_idx in (1, 4, 5, 6, 7):
-                    c.alignment = Alignment(horizontal="center", vertical="center")
-                else:
-                    c.alignment = Alignment(horizontal="left", vertical="center")
+        # Spacer between sections
+        ws.row_dimensions[curr_row].height = 12
+        curr_row += 1
 
-            ws.row_dimensions[current_row_idx].height = 20
-            current_row_idx += 1
+        # 4. Section 2: Detailed Punch Logs
+        ws.row_dimensions[curr_row].height = 22
+        ws.merge_cells(start_row=curr_row, start_column=1, end_row=curr_row, end_column=7)
+        s2_title = ws.cell(row=curr_row, column=1, value="2. Detailed Punch Logs")
+        s2_title.font = section_font
+        s2_title.alignment = Alignment(horizontal="left", vertical="center")
+        curr_row += 1
 
-        # Auto-fit column widths
-        for col in ws.columns:
-            max_len = 0
-            col_letter = openpyxl.utils.get_column_letter(col[0].column)
-            for cell in col:
-                if cell.row >= 6 and cell.value:
-                    max_len = max(max_len, len(str(cell.value)))
-            calculated_width = min(max(max_len + 4, 14), 32)
-            ws.column_dimensions[col_letter].width = calculated_width
+        # Freeze panes at the detailed punch logs
+        log_header_row_idx = curr_row
+        ws.freeze_panes = f'A{log_header_row_idx + 1}'
+
+        ws.row_dimensions[curr_row].height = 24
+        log_headers = ['Emp ID', 'Employee Name', 'Department', 'Date', 'Time', 'Punch Type', 'Timestamp']
+        for col_num, h_text in enumerate(log_headers, 1):
+            cell = ws.cell(row=curr_row, column=col_num, value=h_text)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center" if col_num in (1, 4, 5, 6, 7) else "left", vertical="center")
+        curr_row += 1
+
+        if not records:
+            ws.row_dimensions[curr_row].height = 20
+            ws.merge_cells(start_row=curr_row, start_column=1, end_row=curr_row, end_column=7)
+            empty_cell = ws.cell(row=curr_row, column=1, value="No punch events recorded in this period")
+            empty_cell.alignment = Alignment(horizontal="center", vertical="center")
+            empty_cell.font = Font(size=9, italic=True, color="64748B")
+            for col_idx in range(1, 8):
+                ws.cell(row=curr_row, column=col_idx).fill = even_fill
+                ws.cell(row=curr_row, column=col_idx).border = thin_border
+            curr_row += 1
+        else:
+            for r in records:
+                row_fill = even_fill if curr_row % 2 == 0 else odd_fill
+                punch_type_val = r['type']
+
+                row_values = [
+                    r['emp_id'],
+                    r['emp_name'],
+                    r['department'],
+                    r['date'],
+                    r['time'],
+                    r['type'],
+                    r['timestamp'],
+                ]
+
+                for col_idx, val in enumerate(row_values, 1):
+                    c = ws.cell(row=curr_row, column=col_idx, value=val)
+                    c.fill = row_fill
+                    c.border = thin_border
+                    c.font = Font(size=9, color="0F172A")
+
+                    # Highlight Punch Type cell
+                    if col_idx == 6:
+                        if punch_type_val == 'IN':
+                            c.fill = in_fill
+                            c.font = Font(size=9, bold=True, color="15803D")
+                        elif punch_type_val == 'OUT':
+                            c.fill = out_fill
+                            c.font = Font(size=9, bold=True, color="B91C1C")
+
+                    if col_idx in (1, 4, 5, 6, 7):
+                        c.alignment = Alignment(horizontal="center", vertical="center")
+                    else:
+                        c.alignment = Alignment(horizontal="left", vertical="center")
+
+                ws.row_dimensions[curr_row].height = 20
+                curr_row += 1
+
+        # 5. Totals / Summary Footer Row
+        ws.row_dimensions[curr_row].height = 22
+        ws.merge_cells(start_row=curr_row, start_column=1, end_row=curr_row, end_column=5)
+        foot_label = ws.cell(row=curr_row, column=1, value=f"Total Events: {summary_stats['total_events']}  |  Present Staff: {summary_stats['present_count']} / {summary_stats['enrolled_count']}")
+        foot_label.font = Font(size=9, bold=True, color="475569")
+        foot_label.alignment = Alignment(horizontal="left", vertical="center")
+        foot_label.fill = summary_footer_fill
+
+        for col in range(1, 6):
+            ws.cell(row=curr_row, column=col).fill = summary_footer_fill
+            ws.cell(row=curr_row, column=col).border = thin_border
+
+        foot_stat = ws.cell(row=curr_row, column=6, value="TOTAL")
+        foot_stat.font = Font(size=9, bold=True, color="1E293B")
+        foot_stat.alignment = Alignment(horizontal="center", vertical="center")
+        foot_stat.fill = summary_footer_fill
+        foot_stat.border = thin_border
+
+        foot_cnt = ws.cell(row=curr_row, column=7, value=f"{summary_stats['total_events']} punch events")
+        foot_cnt.font = Font(size=9, bold=True, color="1D4ED8")
+        foot_cnt.alignment = Alignment(horizontal="center", vertical="center")
+        foot_cnt.fill = summary_footer_fill
+        foot_cnt.border = thin_border
+
+        # Set Column Widths
+        col_widths = {
+            'A': 16, # Emp ID
+            'B': 24, # Employee Name
+            'C': 20, # Department
+            'D': 16, # Days Present / Date
+            'E': 14, # Total Punches / Time
+            'F': 16, # Status / Punch Type
+            'G': 32, # Attendance Dates / Timestamp
+        }
+        for col_letter, w in col_widths.items():
+            ws.column_dimensions[col_letter].width = w
 
         response = HttpResponse(
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -831,7 +966,6 @@ class ExportPdfReportView(APIView):
         td_center = ParagraphStyle('RTDC', fontName='Helvetica', fontSize=8, leading=10, textColor=rl_colors.HexColor('#0F172A'), alignment=1)
         td_in = ParagraphStyle('RTDIN', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=rl_colors.HexColor('#15803D'), alignment=1)
         td_out = ParagraphStyle('RTDOUT', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=rl_colors.HexColor('#B91C1C'), alignment=1)
-        td_abs = ParagraphStyle('RTDABS', fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=rl_colors.HexColor('#B45309'), alignment=1)
 
         elements = []
 
@@ -871,22 +1005,20 @@ class ExportPdfReportView(APIView):
         elements.append(header_table)
         elements.append(Spacer(1, 8))
 
-        # 2. Executive Summary Metrics Cards
+        # 2. Executive Summary Metrics Cards - 3 KPI boxes (No inferred absence)
         summary_data = [
             [
-                Paragraph("TOTAL POPULATION", ParagraphStyle('S1', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#64748B'), alignment=1)),
+                Paragraph("TOTAL ENROLLED", ParagraphStyle('S1', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#64748B'), alignment=1)),
                 Paragraph("PRESENT STAFF", ParagraphStyle('S2', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#16A34A'), alignment=1)),
-                Paragraph("ABSENT STAFF", ParagraphStyle('S3', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#DC2626'), alignment=1)),
                 Paragraph("TOTAL PUNCH EVENTS", ParagraphStyle('S4', fontName='Helvetica-Bold', fontSize=7, textColor=rl_colors.HexColor('#1D4ED8'), alignment=1)),
             ],
             [
                 Paragraph(str(summary_stats['enrolled_count']), ParagraphStyle('V1', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#1E293B'), alignment=1)),
                 Paragraph(str(summary_stats['present_count']), ParagraphStyle('V2', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#16A34A'), alignment=1)),
-                Paragraph(str(summary_stats['absent_count']), ParagraphStyle('V3', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#DC2626'), alignment=1)),
                 Paragraph(str(summary_stats['total_events']), ParagraphStyle('V4', fontName='Helvetica-Bold', fontSize=14, textColor=rl_colors.HexColor('#1D4ED8'), alignment=1)),
             ]
         ]
-        sum_table = Table(summary_data, colWidths=[195, 195, 195, 195])
+        sum_table = Table(summary_data, colWidths=[260, 260, 260])
         sum_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, -1), rl_colors.HexColor('#F8FAFC')),
             ('BOX', (0, 0), (-1, -1), 1, rl_colors.HexColor('#E2E8F0')),
@@ -905,25 +1037,22 @@ class ExportPdfReportView(APIView):
             Paragraph("Department", th_style),
             Paragraph("Days Present", th_style),
             Paragraph("Total Punches", th_style),
-            Paragraph("Status", th_style),
             Paragraph("Attendance Dates", th_style),
         ]
         emp_sum_rows = [emp_sum_headers]
 
         for s in summaries:
-            dates_str = ", ".join(s['dates_present']) if s['dates_present'] else "-"
-            st_style = td_in if s['status'] == 'PRESENT' else td_abs
+            dates_str = ", ".join(s['dates_present']) if s['dates_present'] else "No punches recorded"
             emp_sum_rows.append([
                 Paragraph(s['emp_id'], td_center),
                 Paragraph(s['emp_name'], td_style),
                 Paragraph(s['department'], td_style),
                 Paragraph(str(s['present_days']), td_center),
                 Paragraph(str(s['total_punches']), td_center),
-                Paragraph(s['status'], st_style),
                 Paragraph(dates_str, td_style),
             ])
 
-        emp_sum_table = Table(emp_sum_rows, colWidths=[65, 130, 110, 75, 75, 75, 250])
+        emp_sum_table = Table(emp_sum_rows, colWidths=[70, 150, 130, 85, 85, 260])
         emp_sum_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), rl_colors.HexColor('#1E293B')),
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
@@ -948,17 +1077,28 @@ class ExportPdfReportView(APIView):
         ]
         log_rows = [log_headers]
 
-        for r in records:
-            p_style = td_in if r['type'] == 'IN' else (td_out if r['type'] == 'OUT' else td_abs)
+        if not records:
             log_rows.append([
-                Paragraph(r['emp_id'], td_center),
-                Paragraph(r['emp_name'], td_style),
-                Paragraph(r['department'], td_style),
-                Paragraph(r['date'], td_center),
-                Paragraph(r['time'], td_center),
-                Paragraph(r['type'], p_style),
-                Paragraph(r['timestamp'], td_center),
+                Paragraph("-", td_center),
+                Paragraph("No punch events recorded in this period", td_style),
+                Paragraph("-", td_center),
+                Paragraph("-", td_center),
+                Paragraph("-", td_center),
+                Paragraph("-", td_center),
+                Paragraph("-", td_center),
             ])
+        else:
+            for r in records:
+                p_style = td_in if r['type'] == 'IN' else td_out
+                log_rows.append([
+                    Paragraph(r['emp_id'], td_center),
+                    Paragraph(r['emp_name'], td_style),
+                    Paragraph(r['department'], td_style),
+                    Paragraph(r['date'], td_center),
+                    Paragraph(r['time'], td_center),
+                    Paragraph(r['type'], p_style),
+                    Paragraph(r['timestamp'], td_center),
+                ])
 
         log_table = Table(log_rows, colWidths=[65, 140, 120, 90, 80, 85, 200])
         log_table.setStyle(TableStyle([

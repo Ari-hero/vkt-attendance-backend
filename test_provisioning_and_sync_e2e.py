@@ -161,17 +161,26 @@ class TestDeviceProvisioningAndSyncFlow(TestCase):
         self.assertEqual(canonical['summary']['total_events'], 1)
         self.assertEqual(canonical['summary']['present_count'], 1)
         self.assertEqual(canonical['summary']['enrolled_count'], 2)
-        self.assertEqual(canonical['summary']['total_rows'], 2)
+        self.assertEqual(canonical['summary']['total_rows'], 1)
 
-        r1 = [r for r in canonical['records'] if r['emp_id'] == '2727'][0]
+        # Detailed punch records: actual recorded punches
+        self.assertEqual(len(canonical['records']), 1)
+        r1 = canonical['records'][0]
+        self.assertEqual(r1['emp_id'], '2727')
         self.assertEqual(r1['type'], 'IN')
         self.assertEqual(r1['time'], '09:32:07')
         self.assertEqual(r1['uuid'], test_uuid)
 
-        r2 = [r for r in canonical['records'] if r['emp_id'] == '7'][0]
-        self.assertEqual(r2['type'], 'ABSENT')
-        self.assertEqual(r2['time'], '-')
-        print("PASS: Canonical dataset verified with exact present and absent records.")
+        # Employee presence summaries: both employees evaluated for actual attendance
+        self.assertEqual(len(canonical['employee_summaries']), 2)
+        s_attended = [s for s in canonical['employee_summaries'] if s['emp_id'] == '2727'][0]
+        self.assertEqual(s_attended['present_days'], 1)
+        self.assertTrue(s_attended['has_attendance'])
+
+        s_no_punch = [s for s in canonical['employee_summaries'] if s['emp_id'] == '7'][0]
+        self.assertEqual(s_no_punch['present_days'], 0)
+        self.assertFalse(s_no_punch['has_attendance'])
+        print("PASS: Canonical dataset verified with actual presence summaries and punch logs.")
 
         # Test Excel endpoint
         excel_res = self.client.get(f'/api/reports/export-excel/?date={target_date}', **self.auth_headers)
